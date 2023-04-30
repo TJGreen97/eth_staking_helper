@@ -1,18 +1,19 @@
-"""Reads a deposit data directory along with the deposit data file and the keystore files in order to validate they are correct, no validator is active and we are double depositing. And finally submits the transaction by sending a transaction.
+"""Reads a deposit data directory along with the deposit data file and the keystore files in order
+to validate they are correct, no validator is active and we are double depositing. And finally 
+submits the transaction by sending a transaction.
 
-contract addy: https://etherscan.io/address/0x0194512e77d798e4871973d9cb9d7ddfc0ffd801
+Stakefish contract addy: https://etherscan.io/address/0x0194512e77d798e4871973d9cb9d7ddfc0ffd801
 """
-import argparse
 import json
-import sys
+import logging
 from pathlib import Path
-
 import requests
+from requests.exceptions import HTTPError
 
 from .args import parse_args
 from .onchain import perform_deposit
-from .utils import error
 
+logger = logging.getLogger("eth_staking_helper.__main__")
 
 def parse_deposit_data(path, withdrawal_address):
     with open(path, "r") as json_file:
@@ -29,14 +30,15 @@ def parse_deposit_data(path, withdrawal_address):
         pubkey = validator["pubkey"]
         withdrawal_credentials = validator["withdrawal_credentials"]
         if withdrawal_credentials != expected_credentials:
-            error(
+            raise ValueError(
                 f"Expected {expected_credentials}, but found {withdrawal_credentials=}"
             )
 
         signature = validator["signature"]
         deposit_data_root = validator["deposit_data_root"]
         if pubkey in return_data["validators"]:
-            error(f"{pubkey} seen multiple times")
+            logger.error("Duplicate pubkey, skipping. (%s)", pubkey)
+            continue
 
         pubkeys_field += pubkey
         signatures_field += signature
@@ -61,28 +63,28 @@ def check_beaconchain(return_data):
     Protect the user from making a double deposit.
     """
     if len(return_data["validators"]) > 100:
-        error("Batch contract can not work with more than 100 validators")
+        raise ValueError("Number of validators exceeds batch contract limit of 100 validators")
 
-    args = ",".join(return_data["validators"])
+    args = ",".join(return_data["validators"].keys())
     response = requests.get(f"https://beaconcha.in/api/v1/validator/{args}/deposits")
     if response.status_code != 200:
-        error(f"Requested beaconchain validation and call failed with: {response.text}")
+        raise HTTPError(f"Requested beaconchain validation and call failed with: {response.text}")
 
     result = response.json()
-    deposits_length = len(result["data"])
-    if deposits_length != 0:
-        error(
-            f"Found {deposits_length} already existing deposits for the given public keys. Aborting!"
-        )
+    deposited_pubkeys = [deposit["publickey"] for deposit in response.json()["data"]]
+    if len(deposited_pubkeys) > 0:
+        for pubkey in deposited_pubkeys:
+            logging.error("Pubkey %s has already been deposited", pubkey)
+        raise ValueError("One or more pubkeys have already been deposited")
 
-    print("\n-- Checked beaconchain for validator existence!\n")
+    logging.info("\n-- Checked beaconchain for validator existence!\n")
 
 
 def check_keystore(path, return_data):
     with open(path, "r") as json_file:
         data = json.load(json_file)
         if data["pubkey"] not in return_data["validators"]:
-            error(
+            KeyError(
                 f'{data["pubkey"]} from keystore file {path} was not found in deposit data'
             )
 
@@ -96,14 +98,14 @@ def iterate_files(
             return_data = parse_deposit_data(path, withdrawal_address)
 
     if not return_data:
-        error("Did not find deposit data in the directory")
+        ValueError("Did not find deposit data in the directory")
 
     if should_check_keystores:
         for path in data_dir.iterdir():
             if path.name.startswith("keystore-"):
                 check_keystore(path, return_data)
 
-        print("\n-- Checked keystore files!\n")
+        logging.info("\n-- Checked keystore files!\n")
 
     if should_check_beaconchain:
         check_beaconchain(return_data)
@@ -115,7 +117,7 @@ def main():
     args = parse_args()
     data_dir = Path(args.data_dir)
     if not data_dir.is_dir():
-        error(f"Path {data_dir} is not a directory")
+        NotADirectoryError(f"Path {data_dir} is not a directory")
 
     data = iterate_files(
         data_dir=data_dir,
@@ -123,10 +125,10 @@ def main():
         should_check_keystores=args.check_keystores,
         should_check_beaconchain=args.check_beaconchain,
     )
-    print(f'pubkeys: {data["pubkeys"]}')
-    print(f'withdrawal_credentials: {data["withdrawals"]}')
-    print(f'signatures: {data["signatures"]}')
-    print(f'deposit_data_roots: {data["deposit_data_roots"]}')
+    logging.info("pubkeys: %s", data["pubkeys"])
+    logging.info("withdrawal_credentials: %s", data["withdrawals"])
+    logging.info("signatures: %s", data["signatures"])
+    logging.info("deposit_data_roots: %s", data["deposit_data_roots"])
 
     if args.execute_transaction or args.only_estimate_gas:
         perform_deposit(
